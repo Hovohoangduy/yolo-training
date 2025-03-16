@@ -1,0 +1,6 @@
+path: Image_Coop_Win
+train: train.txt
+val: val.txt
+names: 
+  0: PRICETAG_NORMAL
+  1: PRICETAG_DISCOUNT
