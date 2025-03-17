@@ -1,114 +1,83 @@
-import cv2
 import numpy as np
-import onnxruntime as ort
-import os
-import glob
+import cv2
+from onnxruntime import ort
 
-# Đường dẫn đến mô hình và thư mục
-model_path = "pricetag_12_03.onnx"
-image_folder = "test/images"
-output_folder = "tmp"
-os.makedirs(output_folder, exist_ok=True)
+def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleup=True, stride=32):
+    # Resize and pad image while meeting stride-multiple constraints
+    shape = im.shape[:2]  # current shape [height, width]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
 
-# Load mô hình ONNX và kiểm tra đầu vào/ra
-session = ort.InferenceSession(model_path)
-input_name = session.get_inputs()[0].name
-input_shape = session.get_inputs()[0].shape
-input_width, input_height = input_shape[2], input_shape[3]
+    # Scale ratio (new / old)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    if not scaleup:  # only scale down, do not scale up (for better val mAP)
+        r = min(r, 1.0)
 
-# Kiểm tra đầu ra mô hình
-outputs = session.get_outputs()
-print("Model outputs info:", [{"name": out.name, "shape": out.shape} for out in outputs])
+    # Compute padding
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
 
-# Hàm tạo màu dựa trên class_id
-def get_color(class_id):
-    """Tạo màu sắc duy nhất cho từng class dựa trên HSV."""
-    hue = (class_id * 50) % 180  # Hue trong OpenCV nằm trong [0, 179]
-    saturation = 255
-    value = 255
-    hsv_color = np.uint8([[[hue, saturation, value]]])
-    bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)
-    color = tuple(map(int, bgr_color[0][0]))
-    return color
+    if auto:  # minimum rectangle
+        dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
 
-# Hàm preprocess
-def preprocess(image):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = cv2.resize(image, (input_width, input_height))
-    image = image / 255.0
-    image = image.transpose(2, 0, 1)
-    image = np.expand_dims(image, axis=0).astype(np.float32)
-    return image
+    dw /= 2  # divide padding into 2 sides
+    dh /= 2
 
-# Hàm postprocess
-def postprocess(outputs, image_shape):
-    if len(outputs[0].shape) == 3:
-        output = outputs[0][0]
-    else:
-        output = outputs[0].transpose(0, 2, 1).squeeze(0)
+    if shape[::-1] != new_unpad:  # resize
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+    return im, r, (dw, dh)
 
-    boxes = []
-    confidences = []
-    class_ids = []
+class BoundingBox:
+    def __init__(self, *res):
+        self.label = res[0]
+        self.prob = res[1]
+        self.x1 = res[2]
+        self.y1 = res[3]
+        self.x2 = res[4]
+        self.y2 = res[5]
+        self.w = self.x2 - self.x1
+        self.h = self.y2 - self.y1
+        self.cen_x = int((self.x1+self.x2) / 2)
+        self.cen_y = int((self.y1+self.y2)/2)
+        self.area = self.w * self.h
+    def display(self):
+        print("label: ", self.label, "cenx: ", self.cen_x, "ceny: ", self.cen_y)
 
-    for detection in output:
-        if detection.shape[0] == 84:
-            x, y, w, h = detection[:4]
-            scores = detection[4:]
-            confidence = np.max(scores)
-            class_id = np.argmax(scores)
-        else:
-            x, y, w, h = detection[:4]
-            confidence = detection[4]
-            scores = detection[5:]
-            class_id = np.argmax(scores)
+class Yolov10Model():
+    def __init__(self, model_path, img_size=640, device='cpu'):
+        self.device = device
+        self.session = ort.InferenceSession(model_path)
+        self.img_size = (img_size, img_size)
 
-        if confidence > 0.1:
-            # Chuyển từ (x_center, y_center, w, h) sang (x1, y1, x2, y2)
-            x1 = int((x - w / 2) * image_shape[1])
-            y1 = int((y - h / 2) * image_shape[0])
-            x2 = int((x + w / 2) * image_shape[1])
-            y2 = int((y + h / 2) * image_shape[0])
-
-            boxes.append([x1, y1, x2, y2])
-            confidences.append(float(confidence))
-            class_ids.append(class_id)
-
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-    return boxes, confidences, class_ids, indices
-
-# Xử lý từng ảnh
-for image_path in glob.glob(os.path.join(image_folder, "*.jpg")):
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Không đọc được ảnh: {image_path}")
-        continue
-
-    original_shape = image.shape[:2]
-    input_tensor = preprocess(image)
-    outputs = session.run(None, {input_name: input_tensor})
-
-    boxes, confidences, class_ids, indices = postprocess(outputs, original_shape)
-
-    # Kiểm tra nếu có bounding box nào được phát hiện
-    if indices is not None and len(indices) > 0:
-        indices = indices.flatten()
-
-        for i in indices:
-            x1, y1, x2, y2 = boxes[i]
-            class_id = class_ids[i]
-            color = get_color(class_id)
-
-            # Vẽ bounding box
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-
-            # Vẽ nhãn
-            label = f"Class {class_id} {confidences[i]:.2f}"
-            cv2.putText(image, label, (x1, max(y1 - 10, 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-    # Lưu ảnh
-    output_path = os.path.join(output_folder, os.path.basename(image_path))
-    cv2.imwrite(output_path, image)
-
-print("Hoàn thành! Kết quả đã lưu vào thư mục 'tmp'.")
+    def predict(self, img):
+        print("READ IMAGE SUCCESSFULLY")
+        image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        H, W, C = image.shape
+        image, ratio, dwdh = letterbox(image, auto=False)
+        image = image.transpose(2, 0, 1)
+        image = np.expand_dims(image, 0)
+        image = np.ascontiguousarray(image)
+        im = image.astype(np.float32)
+        im /= 255
+        session = self.session
+        outname = [i.name for i in session.get_outputs()]
+        inname = [i.name for i in session.get_inputs()]
+        inp = {inname[0]:im}
+        outputs = session.run(outname, inp)[0]
+        boxes = []
+        #for _, (batch_id,x0,y0,x1,y1,cls_id,score) in enumerate(outputs):
+        for _, (x0,y0,x1,y1,score,cls_id) in enumerate(outputs[0]):
+            #batch_id = int(batch_id)
+            score = round(float(score),3)
+            if score < 0.2: continue
+            box = np.array([x0,y0,x1,y1])
+            box -= np.array(dwdh*2)
+            box /= ratio
+            box = box.round().astype(np.int32).tolist()
+            cls_id = int(cls_id)
+            box = BoundingBox(cls_id, score, max(0,box[0]), max(0,box[1]), min(W,box[2]), min(H,box[3]))
+            boxes.append(box)
+        return boxes
