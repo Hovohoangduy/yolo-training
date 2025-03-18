@@ -1,83 +1,63 @@
-import numpy as np
 import cv2
-from onnxruntime import ort
+import numpy as np
+import onnxruntime as ort
+import os
+from pathlib import Path
 
-def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleup=True, stride=32):
-    # Resize and pad image while meeting stride-multiple constraints
-    shape = im.shape[:2]  # current shape [height, width]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
+input_folder = "images"
+output_folder = "tmp"
+model_path = "pricetag_15_03.onnx"
+conf_threshold = 0.2
+input_size = 640
+class_colors = [(0, 255, 0), (255, 0, 0)]  # Màu RGB cho từng class
 
-    # Scale ratio (new / old)
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    if not scaleup:  # only scale down, do not scale up (for better val mAP)
-        r = min(r, 1.0)
+os.makedirs(output_folder, exist_ok=True)
 
-    # Compute padding
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+session = ort.InferenceSession(model_path)
+input_name = session.get_inputs()[0].name
+image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-    if auto:  # minimum rectangle
-        dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
+for image_file in image_files:
+    image_path = os.path.join(input_folder, image_file)
+    img = cv2.imread(image_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Chuyển sang RGB để xử lý
+    original_height, original_width = img_rgb.shape[:2]
+    ratio = min(input_size / original_width, input_size / original_height)
+    new_unpad = (int(original_width * ratio), int(original_height * ratio))
+    resized = cv2.resize(img_rgb, new_unpad, interpolation=cv2.INTER_LINEAR)
+    padded = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
+    dw = input_size - new_unpad[0]
+    dh = input_size - new_unpad[1]
+    top, bottom = dh//2, dh - dh//2
+    left, right = dw//2, dw - dw//2
+    padded[top:top+new_unpad[1], left:left+new_unpad[0]] = resized
+    blob = padded.astype(np.float32) / 255.0
+    blob = blob.transpose(2, 0, 1)[np.newaxis, ...]
 
-    dw /= 2  # divide padding into 2 sides
-    dh /= 2
+    outputs = session.run(None, {input_name: blob})[0][0]
 
-    if shape[::-1] != new_unpad:  # resize
-        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
-    return im, r, (dw, dh)
+    for det in outputs:
+        x1, y1, x2, y2, conf, cls_id = det
+        if conf < conf_threshold:
+            continue
 
-class BoundingBox:
-    def __init__(self, *res):
-        self.label = res[0]
-        self.prob = res[1]
-        self.x1 = res[2]
-        self.y1 = res[3]
-        self.x2 = res[4]
-        self.y2 = res[5]
-        self.w = self.x2 - self.x1
-        self.h = self.y2 - self.y1
-        self.cen_x = int((self.x1+self.x2) / 2)
-        self.cen_y = int((self.y1+self.y2)/2)
-        self.area = self.w * self.h
-    def display(self):
-        print("label: ", self.label, "cenx: ", self.cen_x, "ceny: ", self.cen_y)
+        x1 = int((x1 - left)/ratio)
+        y1 = int((y1 - top)/ratio)
+        x2 = int((x2 - left)/ratio)
+        y2 = int((y2 - top)/ratio)
+        
+        x1 = max(0, min(x1, original_width))
+        y1 = max(0, min(y1, original_height))
+        x2 = max(0, min(x2, original_width))
+        y2 = max(0, min(y2, original_height))
 
-class Yolov10Model():
-    def __init__(self, model_path, img_size=640, device='cpu'):
-        self.device = device
-        self.session = ort.InferenceSession(model_path)
-        self.img_size = (img_size, img_size)
+        cls_id = int(cls_id)
+        color = class_colors[cls_id]
+        label = f"Class {cls_id} {conf:.2f}"
 
-    def predict(self, img):
-        print("READ IMAGE SUCCESSFULLY")
-        image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        H, W, C = image.shape
-        image, ratio, dwdh = letterbox(image, auto=False)
-        image = image.transpose(2, 0, 1)
-        image = np.expand_dims(image, 0)
-        image = np.ascontiguousarray(image)
-        im = image.astype(np.float32)
-        im /= 255
-        session = self.session
-        outname = [i.name for i in session.get_outputs()]
-        inname = [i.name for i in session.get_inputs()]
-        inp = {inname[0]:im}
-        outputs = session.run(outname, inp)[0]
-        boxes = []
-        #for _, (batch_id,x0,y0,x1,y1,cls_id,score) in enumerate(outputs):
-        for _, (x0,y0,x1,y1,score,cls_id) in enumerate(outputs[0]):
-            #batch_id = int(batch_id)
-            score = round(float(score),3)
-            if score < 0.2: continue
-            box = np.array([x0,y0,x1,y1])
-            box -= np.array(dwdh*2)
-            box /= ratio
-            box = box.round().astype(np.int32).tolist()
-            cls_id = int(cls_id)
-            box = BoundingBox(cls_id, score, max(0,box[0]), max(0,box[1]), min(W,box[2]), min(H,box[3]))
-            boxes.append(box)
-        return boxes
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(img, label, (x1, y1 - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    output_path = os.path.join(output_folder, image_file)
+    cv2.imwrite(output_path, img)
