@@ -3,3 +3,5 @@ val
 test
 *.onnx
 *.txt
+images
+tmp

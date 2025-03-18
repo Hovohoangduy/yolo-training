@@ -1,1 +1,1 @@
-# yolot_training
+# yolo_training
